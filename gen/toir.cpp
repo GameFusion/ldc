@@ -652,8 +652,8 @@ LLConstant* AddExp::toConstElem(IRState* p)
     }
 
     error("expression '%s' is not a constant", toChars());
-    fatal();
-    return NULL;
+    if (!global.gag) fatal();
+    return llvm::UndefValue::get(DtoType(type));
 }
 
 /// Tries to remove a MulExp by a constant value of baseSize from e. Returns
@@ -766,8 +766,8 @@ LLConstant* MinExp::toConstElem(IRState* p)
     }
 
     error("expression '%s' is not a constant", toChars());
-    fatal();
-    return NULL;
+    if (!global.gag) fatal();
+    return llvm::UndefValue::get(DtoType(type));
 }
 
 DValue* MinExp::toElem(IRState* p)
@@ -1231,7 +1231,7 @@ Lerr:
     error("cannot cast %s to %s at compile time", e1->type->toChars(), type->toChars());
     if (!global.gag)
         fatal();
-    return NULL;
+    return llvm::UndefValue::get(DtoType(type));
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -1290,11 +1290,7 @@ llvm::Constant* SymOffExp::toConstElem(IRState* p)
     IF_LOG Logger::println("SymOffExp::toConstElem: %s @ %s", toChars(), type->toChars());
     LOG_SCOPE;
 
-    // We might get null here due to the hackish implementation of
-    // AssocArrayLiteralExp::toElem.
     llvm::Constant* base = DtoConstSymbolAddress(loc, var);
-    if (!base) return 0;
-
     llvm::Constant* result;
     if (offset == 0)
     {
@@ -1462,7 +1458,8 @@ LLConstant* AddrExp::toConstElem(IRState* p)
     else if (e1->op == TOKslice)
     {
         error("non-constant expression '%s'", toChars());
-        fatal();
+        if (!global.gag) fatal();
+        return llvm::UndefValue::get(DtoType(type));
     }
     // not yet supported
     else
@@ -2872,7 +2869,8 @@ LLConstant* FuncExp::toConstElem(IRState* p)
     {
         assert(fd->tok == TOKdelegate || fd->tok == TOKreserved);
         error("delegate literals as constant expressions are not yet allowed");
-        return 0;
+        if (!global.gag) fatal();
+        return llvm::UndefValue::get(DtoType(type));
     }
 
     // We need to actually codegen the function here, as literals are not added
@@ -3302,6 +3300,36 @@ DValue* RemoveExp::toElem(IRState* p)
 
 //////////////////////////////////////////////////////////////////////////////////////////
 
+/// Constructs an array initializer constant with the given constants as its
+/// elements. If the element types differ (unions, …), an anonymous struct
+/// literal is emitted (as for array constant initializers).
+static llvm::Constant* arrayConst(std::vector<llvm::Constant*>& vals,
+    Type* nominalElemType)
+{
+    if (vals.size() == 0)
+    {
+        llvm::ArrayType* type = llvm::ArrayType::get(DtoType(nominalElemType), 0);
+        return llvm::ConstantArray::get(type, vals);
+    }
+
+    llvm::Type* elementType = NULL;
+    bool differentTypes = false;
+    for (std::vector<llvm::Constant*>::iterator i = vals.begin(), end = vals.end();
+         i != end; ++i)
+    {
+        if (!elementType)
+            elementType = (*i)->getType();
+        else
+            differentTypes |= (elementType != (*i)->getType());
+    }
+
+    if (differentTypes)
+        return llvm::ConstantStruct::getAnon(vals, true);
+
+    llvm::ArrayType *t = llvm::ArrayType::get(elementType, vals.size());
+    return llvm::ConstantArray::get(t, vals);
+}
+
 DValue* AssocArrayLiteralExp::toElem(IRState* p)
 {
     Logger::print("AssocArrayLiteralExp::toElem: %s @ %s\n", toChars(), type->toChars());
@@ -3356,16 +3384,16 @@ DValue* AssocArrayLiteralExp::toElem(IRState* p)
 
         LLConstant* idxs[2] = { DtoConstUint(0), DtoConstUint(0) };
 
-        LLArrayType* arrtype = LLArrayType::get(DtoType(indexType), keys->dim);
-        LLConstant* initval = LLConstantArray::get(arrtype, keysInits);
-        LLConstant* globalstore = new LLGlobalVariable(*gIR->module, arrtype, false, LLGlobalValue::InternalLinkage, initval, ".aaKeysStorage");
+        LLConstant* initval = arrayConst(keysInits, indexType);
+        LLConstant* globalstore = new LLGlobalVariable(*gIR->module, initval->getType(),
+            false, LLGlobalValue::InternalLinkage, initval, ".aaKeysStorage");
         LLConstant* slice = llvm::ConstantExpr::getGetElementPtr(globalstore, idxs, true);
         slice = DtoConstSlice(DtoConstSize_t(keys->dim), slice);
         LLValue* keysArray = DtoAggrPaint(slice, funcTy->getParamType(1));
 
-        arrtype = LLArrayType::get(DtoType(vtype), values->dim);
-        initval = LLConstantArray::get(arrtype, valuesInits);
-        globalstore = new LLGlobalVariable(*gIR->module, arrtype, false, LLGlobalValue::InternalLinkage, initval, ".aaValuesStorage");
+        initval = arrayConst(valuesInits, vtype);
+        globalstore = new LLGlobalVariable(*gIR->module, initval->getType(),
+            false, LLGlobalValue::InternalLinkage, initval, ".aaValuesStorage");
         slice = llvm::ConstantExpr::getGetElementPtr(globalstore, idxs, true);
         slice = DtoConstSlice(DtoConstSize_t(keys->dim), slice);
         LLValue* valuesArray = DtoAggrPaint(slice, funcTy->getParamType(2));
@@ -3527,5 +3555,10 @@ llvm::Constant* Expression::toConstElem(IRState * p)
     error("expression '%s' is not a constant", toChars());
     if (!global.gag)
         fatal();
-    return NULL;
+
+    // Do not return null here, as AssocArrayLiteralExp::toElem determines
+    // whether it can allocate the needed arrays statically by just invoking
+    // toConstElem on its key/value expressions, and handling the null value
+    // consequently would require error-prone adaptions in all other code.
+    return llvm::UndefValue::get(DtoType(type));
 }
